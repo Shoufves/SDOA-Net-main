@@ -15,7 +15,7 @@ import doasys
 #import doa_method 没传这个文件
 from scipy import io
 
-import matlab.engine
+import matlab.engine  # 服务器无MATLAB许可证，已关闭
 
 
 def make_hankel(signal, m):
@@ -45,11 +45,24 @@ def music(signal, xgrid, nfreq, m=20):
     return music_fr
 
 
+# 加载旧版SDOA-Net模型的辅助函数（net0.pkl由原版doasys.spectrumModule保存）
+def load_legacy_model(path, use_cuda):
+    _orig_class = doasys.spectrumModule
+    doasys.spectrumModule = doasys.spectrumModuleV0
+    if use_cuda:
+        net = torch.load(path, weights_only=False)
+    else:
+        net = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
+    doasys.spectrumModule = _orig_class
+    return net
+
+
 if __name__ == '__main__':
 
-    is_music = True
-    is_anm = True
+    is_music = False  # 服务器无MATLAB许可证，已关闭MUSIC对比
+    is_anm = False    # 服务器无MATLAB许可证，已关闭ANM对比
     is_proposed = True
+    is_legacy = True  # 是否加载原版SDOA-Net（net0.pkl）进行对比
 
     is_fig = True
     is_save = False
@@ -112,17 +125,39 @@ if __name__ == '__main__':
     ref_grid = doa_grid
     # generate the training data
 
-    loss_arr = np.load('loss.npz')
-
-    loss_train = loss_arr['arr_0']
-    loss_val = loss_arr['arr_1']
+    # 加载新版SDOA-Net（含Cross-Attention）
     if args.use_cuda:
         net = torch.load('net.pkl', weights_only=False)
     else:
         net = torch.load('net.pkl', map_location=torch.device('cpu'), weights_only=False)
 
+    # 加载原版SDOA-Net（不含Cross-Attention，用于对比）
+    if is_legacy:
+        net0 = load_legacy_model('net0.pkl', args.use_cuda)
+        print("Loaded original SDOA-Net from net0.pkl")
+
+    # PyTorch 2.6+ compatibility
+    for module in net.modules():
+        if isinstance(module, nn.Conv1d) and not hasattr(module, '_reversed_padding_repeated_twice'):
+            p = module.padding
+            module._reversed_padding_repeated_twice = (p, p) if isinstance(p, int) else tuple(p) * 2
+    if is_legacy:
+        for module in net0.modules():
+            if isinstance(module, nn.Conv1d) and not hasattr(module, '_reversed_padding_repeated_twice'):
+                p = module.padding
+                module._reversed_padding_repeated_twice = (p, p) if isinstance(p, int) else tuple(p) * 2
+
     if args.use_cuda:
         net.cuda()
+        if is_legacy:
+            net0.cuda()
+
+    # 多GPU支持：双卡3090 DataParallel
+    if args.use_cuda and torch.cuda.device_count() > 1:
+        print("Using %d GPUs: %s" % (torch.cuda.device_count(), torch.cuda.get_device_name(0)))
+        net = nn.DataParallel(net)
+        if is_legacy:
+            net0 = nn.DataParallel(net0)
 
     # 构建字典矩阵，公式26
     dic_mat = np.zeros((doa_grid.size, 2, args.ant_num))
@@ -141,13 +176,14 @@ if __name__ == '__main__':
     # SNR_range = np.linspace(0, 30, 4)
     SNR_range = np.linspace(10, 30, 7)
     RMSE = np.zeros((SNR_range.size, 1))
+    RMSE_legacy = np.zeros((SNR_range.size, 1))
     RMSE_FFT = np.zeros((SNR_range.size, 1))
     RMSE_MUSIC = np.zeros((SNR_range.size, 1))
     RMSE_OMP = np.zeros((SNR_range.size, 1))
     RMSE_ANM = np.zeros((SNR_range.size, 1))
 
-    eng = matlab.engine.start_matlab()
-    eng.cvx_startup(nargout=0)
+    eng = matlab.engine.start_matlab()           # 服务器无MATLAB许可证，已关闭
+    eng.cvx_startup(nargout=0)                   # 服务器无MATLAB许可证，已关闭
 
     # dic_music = np.zeros((doa_grid.size, antnum_reshape), dtype=complex)
     # for idx2 in range(doa_grid.size):
@@ -156,13 +192,14 @@ if __name__ == '__main__':
     for n in range(SNR_range.size):
         n_test = 100 # 10
         RMSE[n] = 0
+        RMSE_legacy[n] = 0
         RMSE_FFT[n] = 0
         RMSE_MUSIC[n] = 0
         RMSE_OMP[n] = 0
         RMSE_ANM[n] = 0
         for n1 in range(n_test):
             epoch_start_time = time.time()
-            test_len = 2 # 2000
+            test_len = 2000
             signal, doa, target_num = doasys.gen_signal(test_len, args)
             ref_sp = doasys.gen_refsp(doa, ref_grid, args.gaussian_std / args.ant_num)
             signal = torch.from_numpy(signal).float()
@@ -175,8 +212,6 @@ if __name__ == '__main__':
                     noisy_signals = noisy_signals.cuda()
                 with torch.no_grad():
                     output_net = net(noisy_signals).view(test_len, 2, -1)
-
-                # output_net = net(noisy_signals).view(test_len, 2, -1)
 
                 mm_real = torch.mm(output_net[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_net[:, 1, :],
                                                                                              dic_mat_torch[:, 1, :].T)
@@ -191,6 +226,27 @@ if __name__ == '__main__':
                 est_doa = doasys.get_doa(sp_np, doa_num, doa_grid, args.max_target_num, doa)
                 RMSE[n] = RMSE[n] + np.sum(np.power(np.abs(est_doa - doa), 2))
 
+            # 原版SDOA-Net（不含Cross-Attention）对比
+            if is_legacy:
+                if args.use_cuda:
+                    noisy_signals_legacy = noisy_signals
+                else:
+                    noisy_signals_legacy = noisy_signals
+                with torch.no_grad():
+                    output_net0 = net0(noisy_signals_legacy).view(test_len, 2, -1)
+
+                mm_real0 = torch.mm(output_net0[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_net0[:, 1, :],
+                                                                                               dic_mat_torch[:, 1, :].T)
+                mm_imag0 = torch.mm(output_net0[:, 0, :], dic_mat_torch[:, 1, :].T) - torch.mm(output_net0[:, 1, :],
+                                                                                               dic_mat_torch[:, 0, :].T)
+                sp0 = torch.pow(mm_real0, 2) + torch.pow(mm_imag0, 2)
+                sp0_np = sp0.cpu().detach().numpy()
+                for idx_sp in range(sp0_np.shape[0]):
+                    sp0_np[idx_sp] = sp0_np[idx_sp] / np.max(sp0_np[idx_sp])
+
+                est_doa0 = doasys.get_doa(sp0_np, doa_num, doa_grid, args.max_target_num, doa)
+                RMSE_legacy[n] = RMSE_legacy[n] + np.sum(np.power(np.abs(est_doa0 - doa), 2))
+
             # FFT method
             if args.use_cuda:
                 r = noisy_signals.cpu().detach().numpy()
@@ -198,13 +254,14 @@ if __name__ == '__main__':
                 r = noisy_signals.detach().numpy()
             r_c = r[:, 0, :] + 1j * r[:, 1, :]
             sp_FFT = np.power(np.abs(np.matmul(dic_mat_comp, np.conj(r_c).T)), 2).T
+
             for idx_sp in range(sp_FFT.shape[0]):
                 sp_FFT[idx_sp] = sp_FFT[idx_sp] / np.max(sp_FFT[idx_sp])
             doa_num = (doa >= -90).sum(axis=1)
             est_doa = doasys.get_doa(sp_FFT, doa_num, doa_grid, args.max_target_num, doa)
             RMSE_FFT[n] = RMSE_FFT[n] + np.sum(np.power(np.abs(est_doa - doa), 2))
 
-            # MUSIC alg
+            # MUSIC alg  -- 服务器无MATLAB许可证，已关闭
             if is_music:
                 if args.use_cuda:
                     r = noisy_signals.cpu().detach().numpy()
@@ -243,7 +300,7 @@ if __name__ == '__main__':
                 est_doa_omp[idx1] = np.sort(est_doa_omp[idx1])
             RMSE_OMP[n] = RMSE_OMP[n] + np.sum(np.power(np.abs(est_doa_omp - doa), 2))
 
-            # atomic norm minimization alg
+            # atomic norm minimization alg  -- 服务器无MATLAB许可证，已关闭
             if is_anm:
                 if args.use_cuda:
                     r = noisy_signals.cpu().detach().numpy()
@@ -266,7 +323,9 @@ if __name__ == '__main__':
             if is_fig:
                 plt.figure()
                 if is_proposed:
-                    plt.plot(doa_grid, sp_np[0], label='Proposed method')
+                    plt.plot(doa_grid, sp_np[0], label='SDOA-Net + Cross-Attn')
+                if is_legacy:
+                    plt.plot(doa_grid, sp0_np[0], label='SDOA-Net (original)')
                 plt.plot(doa_grid, sp_FFT[0], label='FFT method')
                 if is_anm:
                     plt.plot(doa_grid, sp_ANM[0], label='ANM method')
@@ -289,12 +348,17 @@ if __name__ == '__main__':
                 if tmp_doa.size == 3:
                     io.savemat('doa_grid.mat', {'array': doa_grid})
                     io.savemat('sp_proposed.mat', {'array': sp_np[0]})
-                    io.savemat('sp_ANM.mat', {'array': sp_ANM[0]})
-                    io.savemat('sp_MUSIC.mat', {'array': sp_MUSIC[0]})
+                    if is_legacy:
+                        io.savemat('sp_legacy.mat', {'array': sp0_np[0]})
+                    if is_anm:
+                        io.savemat('sp_ANM.mat', {'array': sp_ANM[0]})
+                    if is_music:
+                        io.savemat('sp_MUSIC.mat', {'array': sp_MUSIC[0]})
                     io.savemat('sp_FFT.mat', {'array': sp_FFT[0]})
 
             print("SNR: %.2f dB, Test: %d/%d, Time: %.2f" % (SNR_dB, n1, n_test, time.time() - epoch_start_time))
         RMSE[n] = np.sqrt(RMSE[n] / (doa.size * n_test))
+        RMSE_legacy[n] = np.sqrt(RMSE_legacy[n] / (doa.size * n_test))
         RMSE_FFT[n] = np.sqrt(RMSE_FFT[n] / (doa.size * n_test))
         if is_music:
             RMSE_MUSIC[n] = np.sqrt(RMSE_MUSIC[n] / (doa.size * n_test))
@@ -302,15 +366,17 @@ if __name__ == '__main__':
         if is_anm:
             RMSE_ANM[n] = np.sqrt(RMSE_ANM[n] / (doa.size * n_test))
         print(
-            "SNR (dB): %.2f dB, RMSE (deg): %.2f, RMSE_FFT (deg): %.2f, RMSE_OMP (deg): %.2f, RMSE_ANM (deg): %.2f, RMSE_MUSIC (deg): %.2f" % (
-                SNR_dB, RMSE[n], RMSE_FFT[n], RMSE_OMP[n], RMSE_ANM[n], RMSE_MUSIC[n]))
+            "SNR (dB): %.2f dB, RMSE_XAttn (deg): %.2f, RMSE_SDOA (deg): %.2f, RMSE_FFT (deg): %.2f, RMSE_OMP (deg): %.2f" % (
+                SNR_dB, RMSE[n], RMSE_legacy[n], RMSE_FFT[n], RMSE_OMP[n]))
 
     plt.figure()
-    plt.semilogy(SNR_range, RMSE, linestyle='-', marker='o', linewidth=2, markersize=8, label='Proposed method')
+    plt.semilogy(SNR_range, RMSE, linestyle='-', marker='o', linewidth=2, markersize=8, label='SDOA-Net + Cross-Attn')
+    if is_legacy:
+        plt.semilogy(SNR_range, RMSE_legacy, linestyle='-', marker='D', linewidth=2, markersize=8, label='SDOA-Net (original)')
     plt.semilogy(SNR_range, RMSE_FFT, linestyle='-', marker='v', linewidth=2, markersize=8, label='FFT method')
-    plt.semilogy(SNR_range, RMSE_MUSIC, linestyle='-', marker='x', linewidth=2, markersize=8, label='MUSIC method')
+    # plt.semilogy(SNR_range, RMSE_MUSIC, linestyle='-', marker='x', linewidth=2, markersize=8, label='MUSIC method')
     plt.semilogy(SNR_range, RMSE_OMP, linestyle='-', marker='+', linewidth=2, markersize=8, label='OMP method')
-    plt.semilogy(SNR_range, RMSE_ANM, linestyle='-', marker='s', linewidth=2, markersize=8, label='ANM method')
+    # plt.semilogy(SNR_range, RMSE_ANM, linestyle='-', marker='s', linewidth=2, markersize=8, label='ANM method')
     plt.xlabel('SNR (dB)')
     plt.ylabel('RMSE (deg)')
     plt.legend()
@@ -321,13 +387,15 @@ if __name__ == '__main__':
     if is_save:
         io.savemat('SNR_range.mat', {'array': SNR_range})
         io.savemat('RMSE.mat', {'array': RMSE})
+        io.savemat('RMSE_legacy.mat', {'array': RMSE_legacy})
         io.savemat('RMSE_FFT.mat', {'array': RMSE_FFT})
-        io.savemat('RMSE_MUSIC.mat', {'array': RMSE_MUSIC})
+        # io.savemat('RMSE_MUSIC.mat', {'array': RMSE_MUSIC})
         io.savemat('RMSE_OMP.mat', {'array': RMSE_OMP})
-        io.savemat('RMSE_ANM.mat', {'array': RMSE_ANM})
+        # io.savemat('RMSE_ANM.mat', {'array': RMSE_ANM})
 
     # plt.figure()
-    # plt.semilogy(SNR_range, savitzky_golay(RMSE, 50, 3), linestyle='-', marker='o', linewidth=2, markersize=8, label='Proposed method')
+    # plt.semilogy(SNR_range, savitzky_golay(RMSE, 50, 3), linestyle='-', marker='o', linewidth=2, markersize=8, label='SDOA-Net + Cross-Attn')
+    # plt.semilogy(SNR_range, savitzky_golay(RMSE_legacy, 50, 3), linestyle='-', marker='D', linewidth=2, markersize=8, label='SDOA-Net (original)')
     # plt.semilogy(SNR_range, savitzky_golay(RMSE_FFT, 50, 3), linestyle='-', marker='v', linewidth=2, markersize=8, label='FFT method')
     # plt.semilogy(SNR_range, savitzky_golay(RMSE_MUSIC, 50, 3), linestyle='-', marker='x', linewidth=2, markersize=8, label='MUSIC method')
     # plt.semilogy(SNR_range, savitzky_golay(RMSE_OMP, 50, 3), linestyle='-', marker='+', linewidth=2, markersize=8, label='OMP method')

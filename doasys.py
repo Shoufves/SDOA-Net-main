@@ -98,7 +98,47 @@ def noise_torch(s, snr):
     return (s + noise).view(bsz, -1, signal_dim)
 
 
-# SDOA-Net的网络结构，输入为时域信号，输出为空间谱
+# 轻量级Cross-Attention模块，用于捕获卷积层之间的长距离依赖关系
+class CrossAttention(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.d_model = 16
+        self.num_heads = 4
+        self.head_dim = self.d_model // self.num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.in_proj = nn.Linear(in_dim, self.d_model, bias=False)
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.out_proj = nn.Linear(self.d_model, in_dim, bias=False)
+
+    def forward(self, x):
+        # x: (batch_size, seq_len, in_dim)
+        bsz, seq_len, _ = x.shape
+        residual = x
+
+        x = self.in_proj(x)  # (bsz, seq_len, d_model)即(bsz, 32, 16)
+
+        # qkv shape: (bsz, 4, 32, 4) (批次, 4个头, 序列长度32, 每个头维度4)
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # k.transpose: (bsz, 4, 4, 32) 与q相乘变为(bsz, 4, 32, 32)
+        # (32, 32)是注意力权重矩阵
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+
+        # 加权求和 (bsz, 4, 32, 32) @ (bsz, 4, 32, 4) = (bsz, 4, 32, 4)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model) # (bsz, 32, 16)
+        out = self.out_proj(out)  # (bsz, seq_len, in_dim)即(bsz, 32, 2)
+
+        return (out + residual).contiguous()  # 残差连接
+
+
+# SDOA-Net的网络结构，输入为时域信号，输出为空间谱（含Cross-Attention）
 class spectrumModule(nn.Module):
     def __init__(self, signal_dim=8, n_filters=8, n_layers=3, inner_dim=125,
                  kernel_size=3):
@@ -115,8 +155,44 @@ class spectrumModule(nn.Module):
                 nn.ReLU(),
             ]
         self.mod = nn.Sequential(*mod)
+        # 在卷积层之后、展平之前插入Cross-Attention，捕获阵元间长距离依赖
+        self.attn = CrossAttention(n_filters)
         # self.out_layer1 = nn.ConvTranspose1d(n_filters, 1, 4, stride=1, padding=4 // 2, output_padding=1, bias=False)
         # self.linear1 = nn.Linear(inner_dim, 2 * signal_dim, bias=False)
+        self.out_layer = nn.Linear(inner_dim * n_filters, 2 * signal_dim, bias=False)
+
+
+    def forward(self, inp):
+        bsz = inp.size(0)
+        inp = inp.view(bsz, -1)   # (bsz, 32)
+        x = self.in_layer(inp).view(bsz, self.n_filters, -1)  # (bsz, 2, 32)
+        x = self.mod(x)   # (bsz, 2, 32) 经过 6 层卷积
+        # Cross-Attention: 将inner_dim视作序列长度，在n_filters特征维度上做多头注意力
+        x = x.transpose(1, 2)          # (bsz, inner_dim, n_filters)即(bsz, 32, 2)
+        x = self.attn(x)               # (bsz, inner_dim, n_filters)调用多头注意力，shape不变
+        x = x.transpose(1, 2)          # (bsz, n_filters, inner_dim)即(bsz, 2, 32)
+        x = x.reshape(bsz, -1)    # (bsz, 64) 展平
+        x = self.out_layer(x).view(bsz, -1)     # (bsz, 32)
+        return x
+
+
+# 原版SDOA-Net（不含Cross-Attention），用于加载旧模型net0.pkl
+class spectrumModuleV0(nn.Module):
+    def __init__(self, signal_dim=8, n_filters=8, n_layers=3, inner_dim=125,
+                 kernel_size=3):
+        super().__init__()
+        self.n_filters = n_filters
+        self.in_layer = nn.Linear(2 * signal_dim, inner_dim * n_filters, bias=False)
+        mod = []
+        for n in range(n_layers):  # padding=kernel_size - 1
+            mod += [
+                nn.Conv1d(n_filters, n_filters, kernel_size=kernel_size, padding=kernel_size // 2, bias=False,
+                          padding_mode='circular'),
+                # nn.Conv1d(n_filters, n_filters, kernel_size=kernel_size, padding=kernel_size - 1, bias=False),
+                nn.BatchNorm1d(n_filters),
+                nn.ReLU(),
+            ]
+        self.mod = nn.Sequential(*mod)
         self.out_layer = nn.Linear(inner_dim * n_filters, 2 * signal_dim, bias=False)
 
 
@@ -198,6 +274,7 @@ def train_net(args, net, optimizer, criterion, train_loader, val_loader,
         noisy_signal = noise_torch(clean_signal, args.snr)
         optimizer.zero_grad()
         output_net = net(noisy_signal).view(args.batch_size, 2, -1)
+
         if net_type == 0:
             mm_real = torch.mm(output_net[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_net[:, 1, :],
                                                                                          dic_mat_torch[:, 1, :].T)

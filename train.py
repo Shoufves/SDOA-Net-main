@@ -103,6 +103,11 @@ if __name__ == '__main__':
     if args.use_cuda:
         net.cuda()
 
+    # 多GPU支持：双卡3090 DataParallel
+    if args.use_cuda and torch.cuda.device_count() > 1:
+        print("Using %d GPUs: %s" % (torch.cuda.device_count(), torch.cuda.get_device_name(0)))
+        net = nn.DataParallel(net)
+
     optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
     # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=7, factor=0.5, verbose=True)
 
@@ -204,7 +209,10 @@ if __name__ == '__main__':
                 #     plt.show()
             if args.net_type == 0:
                 np.savez('loss.npz' , loss_train, loss_val)
-                torch.save(net, 'net.pkl')
+                # 多GPU时保存解包后的模型（去除DataParallel的module前缀）
+                net_to_save = net.module if isinstance(net, nn.DataParallel) else net
+                torch.save(net_to_save, 'net.pkl')
             else:
                 np.savez(('deepfreq_loss_layer%d.npz' % args.n_layers), loss_train, loss_val)
-                torch.save(net, ('deepfreq__layer%d.pkl' % args.n_layers))
+                net_to_save = net.module if isinstance(net, nn.DataParallel) else net
+                torch.save(net_to_save, ('deepfreq__layer%d.pkl' % args.n_layers))
