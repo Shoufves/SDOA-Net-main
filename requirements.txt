@@ -1,0 +1,15 @@
+# SDOA-Net-Attn 项目 conda 依赖
+# GPU 版本（推荐）：
+#   conda create -n sdoa python=3.10
+#   conda install pytorch>=2.0 cudatoolkit=12.1 -c pytorch -c nvidia
+#   conda install --file requirements.txt
+#
+# CPU 版本：
+#   conda install --file requirements.txt -c pytorch
+# （此时忽略下方 cudatoolkit，仅安装 pytorch CPU 版）
+
+numpy>=1.21
+scipy>=1.7
+matplotlib>=3.5
+pytorch>=2.0
+cudatoolkit>=11.8

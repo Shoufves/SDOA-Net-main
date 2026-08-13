@@ -49,6 +49,9 @@ if __name__ == '__main__':
     parser.add_argument('--train_num', type=int, default=1000, help='train a new network')
     parser.add_argument('--net_type', type=int, default=0, help='the type of network')
 
+    # 1-bit 量化开关（单比特ADC模拟）
+    parser.add_argument('--is_1bit', type=int, default=0, help='enable 1-bit quantization in gen_signal (1 for on, 0 for off)')
+
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -211,7 +214,11 @@ if __name__ == '__main__':
                 np.savez('loss.npz' , loss_train, loss_val)
                 # 多GPU时保存解包后的模型（去除DataParallel的module前缀）
                 net_to_save = net.module if isinstance(net, nn.DataParallel) else net
-                torch.save(net_to_save, 'net.pkl')
+                if args.is_1bit:
+                    torch.save(net_to_save, 'net_1bit.pkl')
+                    print("1-bit quantized model saved as net_1bit.pkl")
+                else:
+                    torch.save(net_to_save, 'net.pkl')
             else:
                 np.savez(('deepfreq_loss_layer%d.npz' % args.n_layers), loss_train, loss_val)
                 net_to_save = net.module if isinstance(net, nn.DataParallel) else net

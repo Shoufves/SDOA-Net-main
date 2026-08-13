@@ -72,6 +72,14 @@ def gen_signal(data_num, args):
 
     doa[doa == float('inf')] = -100
     doa = np.sort(doa, axis=1)
+
+    # ---------- 1-bit 量化说明 ----------
+    # 1-bit 量化已移至-加噪之后-执行（与测试流程一致，模拟真实ADC量化含噪接收信号）：
+    #   - 训练：train_net 中 noise_torch 之后对 noisy_signal 取符号
+    #   - 测试：main.py 中对 noisy_signals 取符号
+    # gen_signal 只生成干净信号，不再在此量化。
+    # ------------------------------------
+
     return s.astype('float32'), doa.astype('float32'), target_num
 
 
@@ -272,6 +280,9 @@ def train_net(args, net, optimizer, criterion, train_loader, val_loader,
         if args.use_cuda:
             clean_signal, target_sp = clean_signal.cuda(), target_sp.cuda()
         noisy_signal = noise_torch(clean_signal, args.snr)
+        # 1-bit 量化在加噪之后执行（与测试一致：ADC量化含噪接收信号）
+        if args.is_1bit:
+            noisy_signal = torch.sign(noisy_signal)
         optimizer.zero_grad()
         output_net = net(noisy_signal).view(args.batch_size, 2, -1)
 
@@ -301,6 +312,9 @@ def train_net(args, net, optimizer, criterion, train_loader, val_loader,
     for batch_idx, (noisy_signal, _, target_sp, doa) in enumerate(val_loader):
         if args.use_cuda:
             noisy_signal, target_sp = noisy_signal.cuda(), target_sp.cuda()
+        # 1-bit 量化在加噪之后执行（与训练/测试一致）
+        if args.is_1bit:
+            noisy_signal = torch.sign(noisy_signal)
         with torch.no_grad():
             output_net = net(noisy_signal).view(args.batch_size, 2, -1)
 
