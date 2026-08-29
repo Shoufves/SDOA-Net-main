@@ -52,6 +52,17 @@ if __name__ == '__main__':
     # 1-bit 量化开关（单比特ADC模拟）
     parser.add_argument('--is_1bit', type=int, default=0, help='enable 1-bit quantization in gen_signal (1 for on, 0 for off)')
 
+    # ---------- Dither-CovNet ----------
+    parser.add_argument('--input_mode', type=str, default='signal', choices=['signal', 'cov'],
+                        help='signal: model input = raw/1-bit signal; cov: model input = dither covariance feature')
+    parser.add_argument('--snapshots', type=int, default=16, help='number of snapshots L for covariance feature')
+    parser.add_argument('--dither_T', type=float, default=3.0, help='uniform dither scale T')
+    parser.add_argument('--snr_min_db', type=float, default=0.0, help='training SNR lower bound (dB)')
+    parser.add_argument('--snr_max_db', type=float, default=30.0, help='training SNR upper bound (dB)')
+    parser.add_argument('--single_stage', type=int, default=-1,
+                        help='only train this train_type (0..6); -1 means run all 7 imperfect stages (quick: use 6)')
+    parser.add_argument('--tag', type=str, default='', help='model filename suffix to avoid overwriting')
+
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -68,8 +79,10 @@ if __name__ == '__main__':
 
     if args.new_train:
         if args.net_type == 0:
+            cov_in_dim = 2 * args.ant_num * (args.ant_num + 1) // 2  # 272 for ant_num=16
             net = doasys.spectrumModule(signal_dim=args.ant_num, n_filters=args.n_filters, inner_dim=args.inner_dim,
-                                        n_layers=args.n_layers, kernel_size=args.kernel_size)
+                                        n_layers=args.n_layers, kernel_size=args.kernel_size,
+                                        in_dim=(cov_in_dim if args.input_mode == 'cov' else None))
         else:
             net = doasys.DeepFreq(signal_dim=args.ant_num, n_filters=args.n_filters, inner_dim=args.inner_dim,
                                   n_layers=args.n_layers, kernel_size=args.kernel_size,
@@ -95,6 +108,15 @@ if __name__ == '__main__':
                 net = torch.load(('deepfreq_layer%d.pkl' % args.n_layers), map_location=torch.device('cpu'), weights_only=False)
 
             # net = torch.load('net_layer2.pkl', map_location=torch.device('cpu'))
+
+    # Dither-CovNet 微调：从旧 net.pkl 加载网络，只替换第一层 in_layer（协方差输入 272 维）
+    if args.input_mode == 'cov' and args.net_type == 0:
+        cov_in_dim = 2 * args.ant_num * (args.ant_num + 1) // 2
+        old_w = net.in_layer.weight.data
+        new_in = torch.nn.Linear(cov_in_dim, old_w.shape[0], bias=False).to(old_w.device)
+        # 随机初始化即可；主干权重全部保留
+        net.in_layer = new_in
+        print("Dither-CovNet: in_layer replaced with %d -> %d" % (cov_in_dim, old_w.shape[0]))
 
     # PyTorch 2.6+ compatibility: old-saved Conv1d lack _reversed_padding_repeated_twice
     import torch.nn as nn
@@ -123,6 +145,8 @@ if __name__ == '__main__':
 
     for idx in range(args.train_num):
         for train_type in range(7):
+            if args.single_stage >= 0 and train_type != args.single_stage:
+                continue
             if train_type == 0:
                 args.max_per_std = 0
                 args.max_amp_std = 0
@@ -188,8 +212,8 @@ if __name__ == '__main__':
             signal = torch.from_numpy(signal).float()
             doa = torch.from_numpy(doa).float()
             ref_sp = torch.from_numpy(ref_sp).float()
-            noisy_signals = doasys.noise_torch(signal, args.snr)
-            dataset = data_utils.TensorDataset(noisy_signals, signal, ref_sp, doa)
+            # 训练/验证统一只存干净信号，加噪/量化/协方差在 train_net 内生成
+            dataset = data_utils.TensorDataset(signal, ref_sp, doa)
             val_loader = data_utils.DataLoader(dataset, batch_size=args.batch_size)
 
             start_epoch = 1
@@ -214,9 +238,14 @@ if __name__ == '__main__':
                 np.savez('loss.npz' , loss_train, loss_val)
                 # 多GPU时保存解包后的模型（去除DataParallel的module前缀）
                 net_to_save = net.module if isinstance(net, nn.DataParallel) else net
-                if args.is_1bit:
-                    torch.save(net_to_save, 'net_1bit.pkl')
-                    print("1-bit quantized model saved as net_1bit.pkl")
+                if args.input_mode == 'cov' or args.is_1bit:
+                    if args.input_mode == 'cov':
+                        fname = 'net_1bit_cov_L%d_T%s%s.pkl' % (args.snapshots, str(args.dither_T).replace('.', 'p'), args.tag)
+                        torch.save(net_to_save, fname)
+                        print("Dither-CovNet model saved as %s" % fname)
+                    else:
+                        torch.save(net_to_save, 'net_1bit.pkl')
+                        print("1-bit quantized model saved as net_1bit.pkl")
                 else:
                     torch.save(net_to_save, 'net.pkl')
             else:

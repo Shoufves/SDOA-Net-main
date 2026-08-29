@@ -1,0 +1,68 @@
+\documentclass[tikz,border=10pt]{standalone}
+\usepackage{ctex}
+\usepackage{amsmath,amssymb}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=1.1cm, minimum width=2.6cm, inner sep=4pt},
+  inputbox/.style={box, fill=blue!8},
+  sdoabox/.style={box, fill=orange!12},
+  listabox/.style={box, fill=green!12},
+  fuse/.style={box, fill=purple!10},
+  outbox/.style={box, fill=gray!15},
+  blackbox/.style={draw, dashed, thick, rounded corners=5pt, inner sep=6pt},
+  arrow/.style={-{Stealth[length=3mm]}, thick},
+  note/.style={font=\scriptsize\bfseries, text=black!70}
+]
+
+% ========== 输入 ==========
+\node[inputbox] (rst) {\(L\) 个快拍\\ 1-bit + 抖动\\ 协方差 \(\hat{R}\)\\ 272 维};
+\node[note, above=0.05cm of rst] {输入（线性空间）};
+
+% ========== 分支 1：现有 SDOA-Attn 黑盒 ==========
+\node[sdoabox, right=2.2cm of rst, yshift=2.4cm] (sdoa) {SDOA-Attn\\ 主干（黑盒）\\ 卷积 + CrossAttention};
+\node[sdoabox, right=1.1cm of sdoa] (h) {\(h \in \mathbb{R}^{32}\)};
+\node[sdoabox, right=1.1cm of h] (sp_sdoa) {\(sp_{\mathrm{SDOA}}(\theta)\)\\ \(=|a^H(\theta)h|^2\)};
+
+\draw[arrow] (rst) -- (sdoa);
+\draw[arrow] (sdoa) -- (h);
+\draw[arrow] (h) -- (sp_sdoa);
+
+\node[note, above=0.05cm of sdoa] {分支 1：现有可学习黑盒};
+
+% ========== 分支 2：LISTA 深度展开 ==========
+\node[listabox, right=2.2cm of rst, yshift=-2.4cm] (lista) {LISTA 深度展开\\ 模型驱动 + 可学习层};
+\node[listabox, right=0.6cm of lista] (l1) {Layer 1};
+\node[listabox, right=0.6cm of l1] (l2) {Layer 2};
+\node[right=0.6cm of l2] (dots) {\(\cdots\)};
+\node[listabox, right=0.6cm of dots] (lk) {Layer \(K\)};
+\node[listabox, right=0.9cm of lk] (nu) {稀疏谱 \(\nu\)\\ DOA 候选};
+
+\draw[arrow] (rst) -- (lista);
+\draw[arrow] (lista) -- (l1);
+\draw[arrow] (l1) -- (l2);
+\draw[arrow] (l2) -- (dots);
+\draw[arrow] (dots) -- (lk);
+\draw[arrow] (lk) -- (nu);
+
+\node[blackbox, fit=(lista)(lk), label={[note]above right:分支 2：深度展开（可缝合）}] (bb_lista) {};
+\node[note, below=0.05cm of bb_lista] {\(\nu^{(k+1)} = \mathrm{soft}_{\eta^{(k)}}\!\left(\nu^{(k)} + W^{(k)\top}(c - \Phi \nu^{(k)})\right)\)};
+
+% ========== 融合与输出 ==========
+\node[fuse, right=1.0cm of sp_sdoa, yshift=-2.4cm] (fuse) {融合\\ \(sp = sp_{\mathrm{SDOA}} + \alpha \cdot sp_{\mathrm{LISTA}}\)};
+\node[outbox, right=1.1cm of fuse] (doa) {峰值搜索\\ DOA 估计};
+
+\draw[arrow] (sp_sdoa) -- (fuse);
+\draw[arrow] (nu) -- (fuse);
+\draw[arrow] (fuse) -- (doa);
+
+\node[note, above=0.05cm of fuse] {可学习融合 / 可训练权重 \(\alpha\)};
+\node[note, above=0.05cm of doa] {输出（非学习）};
+
+% ========== 底部说明 ==========
+\node[note, below=0.6cm of doa] {总体：协方差 \(\rightarrow\) SDOA-Attn（黑盒） \(+\) LISTA（深度展开） \(\rightarrow\) 融合谱 \(\rightarrow\) DOA};
+
+\end{tikzpicture}
+\end{document}

@@ -93,17 +93,61 @@ def gen_refsp(doa, doa_grid, sigma):
 
 
 # 添加高斯白噪声
-def noise_torch(s, snr):
+def noise_torch(s, snr, snr_dB=None, snr_min_db=None, snr_max_db=30.0, snapshots=1):
+    """加噪。三种模式：
+       1) snr_dB 给定（测试）：σ = 10^(-snr_dB/20) 固定，只有噪声随机；
+       2) snr_dB 为 None（训练）：SNR_dB ~ U(snr_min_db, snr_max_db) 逐样本采样；
+       3) snr_dB 为 None 且 snr_min_db is None（旧行为兼容）：σ_max = sqrt(1/snr)，σ~U(0,σ_max)。
+       snapshots>1（多快拍）：σ 每样本固定（同一物理场景），噪声逐快拍独立，
+       返回 (B, L, 2, ant_num)；snapshots=1 时返回 (B, 2, ant_num) 兼容旧接口。
+    """
     bsz, _, signal_dim = s.size()
-    s = s.view(bsz, -1)
-    sigma_max = np.sqrt(1. / snr)
-    sigmas = sigma_max * torch.rand(bsz, device=s.device, dtype=s.dtype)
-    # sigmas = math.sqrt(1.0/snr)
+    s_flat = s.view(bsz, -1)
+    if snr_dB is not None:
+        sigmas = torch.full((bsz,), 10.0 ** (-snr_dB / 20.0), device=s.device, dtype=s.dtype)
+    elif snr_min_db is None:
+        sigma_max = np.sqrt(1.0 / snr)
+        sigmas = sigma_max * torch.rand(bsz, device=s.device, dtype=s.dtype)
+    else:
+        snr_db = snr_min_db + (snr_max_db - snr_min_db) * torch.rand(bsz, device=s.device, dtype=s.dtype)
+        sigmas = torch.pow(10.0, -snr_db / 20.0)
 
-    noise = torch.randn(s.size(), device=s.device, dtype=s.dtype)
-    mult = sigmas * torch.norm(s, 2, dim=1) / (torch.norm(noise, 2, dim=1))
-    noise = noise * mult[:, None]
-    return (s + noise).view(bsz, -1, signal_dim)
+    noise = torch.randn(bsz, snapshots, s_flat.shape[1], device=s.device, dtype=s.dtype)
+    mult = sigmas[:, None, None] * torch.norm(s_flat, 2, dim=1)[:, None, None] / \
+           (torch.norm(noise, 2, dim=2)[:, :, None] + 1e-8)
+    noisy = (s_flat[:, None, :] + noise * mult).view(bsz, snapshots, -1, signal_dim)
+    if snapshots == 1:
+        return noisy[:, 0]  # (B, 2, ant_num) 兼容旧接口
+    return noisy            # (B, L, 2, ant_num)
+
+
+# Dither-CovNet 专用：多快拍 + 双独立均匀抖动 → 1-bit 协方差上三角
+def dither_cov_feature(clean_signal, snapshots, T, snr_dB=None,
+                       snr_min_db=0.0, snr_max_db=30.0):
+    """clean_signal: (B, 2, ant_num)
+       返回: (B, 272) 协方差特征（16 阵元复协方差上三角的实虚部）
+    """
+    bsz, _, ant_num = clean_signal.size()
+    noisy = noise_torch(clean_signal, None, snr_dB=snr_dB,
+                        snr_min_db=snr_min_db, snr_max_db=snr_max_db,
+                        snapshots=snapshots)                  # (B, L, 2, N)
+
+    tau1 = (torch.rand_like(noisy) * 2.0 - 1.0) * T
+    tau2 = (torch.rand_like(noisy) * 2.0 - 1.0) * T
+
+    q1 = torch.sign(noisy + tau1)                              # (B, L, 2, N)
+    q2 = torch.sign(noisy + tau2)
+
+    r1 = torch.complex(q1[:, :, 0, :], q1[:, :, 1, :])         # (B, L, N)
+    r2 = torch.complex(q2[:, :, 0, :], q2[:, :, 1, :])
+
+    R1 = T ** 2 * torch.einsum('bln,blm->bnm', r1.conj(), r2) / snapshots
+    R = 0.5 * (R1 + R1.transpose(1, 2).conj())
+
+    idx = torch.triu_indices(ant_num, ant_num, device=R.device)
+    feat = torch.cat([R.real[:, idx[0], idx[1]],
+                      R.imag[:, idx[0], idx[1]]], dim=1)
+    return feat                                                # (B, 272)
 
 
 # 轻量级Cross-Attention模块，用于捕获卷积层之间的长距离依赖关系
@@ -149,10 +193,11 @@ class CrossAttention(nn.Module):
 # SDOA-Net的网络结构，输入为时域信号，输出为空间谱（含Cross-Attention）
 class spectrumModule(nn.Module):
     def __init__(self, signal_dim=8, n_filters=8, n_layers=3, inner_dim=125,
-                 kernel_size=3):
+                 kernel_size=3, in_dim=None):
         super().__init__()
         self.n_filters = n_filters
-        self.in_layer = nn.Linear(2 * signal_dim, inner_dim * n_filters, bias=False)
+        self.in_layer = nn.Linear(in_dim if in_dim is not None else 2 * signal_dim,
+                                  inner_dim * n_filters, bias=False)
         mod = []
         for n in range(n_layers):  # padding=kernel_size - 1
             mod += [
@@ -279,12 +324,22 @@ def train_net(args, net, optimizer, criterion, train_loader, val_loader,
     for batch_idx, (clean_signal, target_sp, doa) in enumerate(train_loader):
         if args.use_cuda:
             clean_signal, target_sp = clean_signal.cuda(), target_sp.cuda()
-        noisy_signal = noise_torch(clean_signal, args.snr)
-        # 1-bit 量化在加噪之后执行（与测试一致：ADC量化含噪接收信号）
-        if args.is_1bit:
-            noisy_signal = torch.sign(noisy_signal)
+        if getattr(args, 'input_mode', 'signal') == 'cov':
+            x_in = dither_cov_feature(clean_signal, args.snapshots, args.dither_T,
+                                      snr_dB=None,
+                                      snr_min_db=getattr(args, 'snr_min_db', 0.0),
+                                      snr_max_db=getattr(args, 'snr_max_db', 30.0))
+        else:
+            noisy_signal = noise_torch(clean_signal, args.snr,
+                                       snr_dB=None,
+                                       snr_min_db=getattr(args, 'snr_min_db', None),
+                                       snr_max_db=getattr(args, 'snr_max_db', 30.0))
+            # 1-bit 量化在加噪之后执行（与测试一致：ADC量化含噪接收信号）
+            if args.is_1bit:
+                noisy_signal = torch.sign(noisy_signal)
+            x_in = noisy_signal
         optimizer.zero_grad()
-        output_net = net(noisy_signal).view(args.batch_size, 2, -1)
+        output_net = net(x_in).view(args.batch_size, 2, -1)
 
         if net_type == 0:
             mm_real = torch.mm(output_net[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_net[:, 1, :],
@@ -309,14 +364,36 @@ def train_net(args, net, optimizer, criterion, train_loader, val_loader,
 
     net.eval()
     loss_val, fnr_val = 0, 0
-    for batch_idx, (noisy_signal, _, target_sp, doa) in enumerate(val_loader):
-        if args.use_cuda:
-            noisy_signal, target_sp = noisy_signal.cuda(), target_sp.cuda()
-        # 1-bit 量化在加噪之后执行（与训练/测试一致）
-        if args.is_1bit:
-            noisy_signal = torch.sign(noisy_signal)
+    for batch_idx, val_batch in enumerate(val_loader):
+        if getattr(args, 'input_mode', 'signal') == 'cov':
+            clean_signal, target_sp, doa = val_batch
+            if args.use_cuda:
+                clean_signal, target_sp = clean_signal.cuda(), target_sp.cuda()
+            x_in = dither_cov_feature(clean_signal, args.snapshots, args.dither_T,
+                                      snr_dB=None,
+                                      snr_min_db=getattr(args, 'snr_min_db', 0.0),
+                                      snr_max_db=getattr(args, 'snr_max_db', 30.0))
+            if args.use_cuda:
+                x_in = x_in.cuda()
+        else:
+            if len(val_batch) == 4:
+                noisy_signal, _, target_sp, doa = val_batch
+                if args.use_cuda:
+                    noisy_signal, target_sp = noisy_signal.cuda(), target_sp.cuda()
+            else:
+                clean_signal, target_sp, doa = val_batch
+                if args.use_cuda:
+                    clean_signal, target_sp = clean_signal.cuda(), target_sp.cuda()
+                noisy_signal = noise_torch(clean_signal, args.snr,
+                                           snr_dB=None,
+                                           snr_min_db=getattr(args, 'snr_min_db', None),
+                                           snr_max_db=getattr(args, 'snr_max_db', 30.0))
+            # 1-bit 量化在加噪之后执行（与训练/测试一致）
+            if args.is_1bit:
+                noisy_signal = torch.sign(noisy_signal)
+            x_in = noisy_signal
         with torch.no_grad():
-            output_net = net(noisy_signal).view(args.batch_size, 2, -1)
+            output_net = net(x_in).view(args.batch_size, 2, -1)
 
         if net_type == 0:
             mm_real = torch.mm(output_net[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_net[:, 1, :],

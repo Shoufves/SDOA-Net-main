@@ -57,6 +57,197 @@ def load_legacy_model(path, use_cuda):
     return net
 
 
+def omp_doa(r_c, dic_mat_comp, doa_grid, target_num, max_target_num):
+    """对一批复信号 r_c (B, N) 逐样本跑 OMP。
+       返回 (est (B, max_target_num), resid (B))；resid = 选完 K 个原子后的残差范数。
+    """
+    est = -100 * np.ones((r_c.shape[0], max_target_num))
+    resid = np.zeros(r_c.shape[0])
+    for idx1 in range(r_c.shape[0]):
+        r_tmp0 = np.expand_dims(r_c[idx1], axis=0)
+        r_tmp1 = r_tmp0
+        max_idx = np.zeros(target_num[idx1], dtype=int)
+        for idx2 in range(target_num[idx1]):
+            max_idx_tmp = np.argmax(np.abs(np.matmul(dic_mat_comp, np.conj(r_tmp1).T)))
+            max_idx[idx2] = max_idx_tmp
+            dic_tmp = dic_mat_comp[max_idx[0:idx2 + 1]]
+            r_tmp1 = r_tmp0 - np.matmul(np.matmul(r_tmp0, np.linalg.pinv(dic_tmp)), dic_tmp)
+            est[idx1, idx2] = doa_grid[max_idx_tmp]
+        est[idx1] = np.sort(est[idx1])
+        resid[idx1] = np.linalg.norm(r_tmp1)
+    return est, resid
+
+
+def run_cov_experiment(args):
+    """Dither-CovNet 出图流程：
+       1) 对比图：六条曲线（float: SDOA/FFT/OMP，1-bit: SDOA-Cov/FFT/OMP），固定 L=256
+       2) L 扫描图：同一网络在不同快拍数 L 下的 RMSE 曲线
+    """
+    doa_grid = np.linspace(-50, 50, args.grid_size, endpoint=False)
+    ref_grid = doa_grid
+    device = 'cuda' if args.use_cuda else 'cpu'
+
+    # 加载浮点 SDOA 模型
+    net_float = torch.load('net.pkl', map_location=device, weights_only=False)
+    net_float.eval()
+    net_float.to(device)
+    for module in net_float.modules():
+        if isinstance(module, nn.Conv1d) and not hasattr(module, '_reversed_padding_repeated_twice'):
+            p = module.padding
+            module._reversed_padding_repeated_twice = (p, p) if isinstance(p, int) else tuple(p) * 2
+
+    # 加载 Dither-CovNet 模型
+    net_1bit = torch.load(args.model_cov, map_location=device, weights_only=False)
+    net_1bit.eval()
+    net_1bit.to(device)
+    for module in net_1bit.modules():
+        if isinstance(module, nn.Conv1d) and not hasattr(module, '_reversed_padding_repeated_twice'):
+            p = module.padding
+            module._reversed_padding_repeated_twice = (p, p) if isinstance(p, int) else tuple(p) * 2
+
+    # 阵列流形字典
+    dic_mat = np.zeros((doa_grid.size, 2, args.ant_num))
+    dic_mat_comp = np.zeros((doa_grid.size, args.ant_num), dtype=complex)
+    for n in range(doa_grid.size):
+        tmp = doasys.steer_vec(doa_grid[n], args.d, args.ant_num, np.zeros(args.ant_num).T)
+        tmp = tmp / np.sqrt(np.sum(np.power(np.abs(tmp), 2)))
+        dic_mat[n, 0] = tmp.real
+        dic_mat[n, 1] = tmp.imag
+        dic_mat_comp[n] = tmp
+    dic_mat_torch = torch.from_numpy(dic_mat).float().to(device)
+
+    cov_L_list = [int(x) for x in args.cov_L_list.split(',')]
+    SNR_range = np.linspace(0, 30, 4)
+    n_snr = SNR_range.size
+
+    accum_cov = np.zeros((len(cov_L_list), n_snr))
+    accum_sdoa_float = np.zeros(n_snr)
+    accum_fft_float = np.zeros(n_snr)
+    accum_omp_float = np.zeros(n_snr)
+    accum_fft_1bit = np.zeros(n_snr)
+    accum_omp_1bit = np.zeros(n_snr)
+    total_units = args.cov_test_len * args.max_target_num * args.cov_test_rounds
+
+    for si, SNR_dB in enumerate(SNR_range):
+        for r in range(args.cov_test_rounds):
+            signal, doa, target_num = doasys.gen_signal(args.cov_test_len, args)
+            signal_t = torch.from_numpy(signal).float().to(device)
+
+            # 同一批干净信号，加固定 SNR 噪声（后期 1-bit 单快拍基线直接用 sign）
+            noisy = doasys.noise_torch(signal_t, None, snr_dB=SNR_dB, snapshots=1)
+            doa_num = (doa >= -90).sum(axis=1)
+
+            # ---------- 浮点信号环境 ----------
+            # SDOA float
+            with torch.no_grad():
+                output_float = net_float(noisy).view(args.cov_test_len, 2, -1)
+            mm_real = torch.mm(output_float[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_float[:, 1, :], dic_mat_torch[:, 1, :].T)
+            mm_imag = torch.mm(output_float[:, 0, :], dic_mat_torch[:, 1, :].T) - torch.mm(output_float[:, 1, :], dic_mat_torch[:, 0, :].T)
+            sp_float = torch.pow(mm_real, 2) + torch.pow(mm_imag, 2)
+            sp_float_np = sp_float.cpu().detach().numpy()
+            for idx_sp in range(sp_float_np.shape[0]):
+                sp_float_np[idx_sp] = sp_float_np[idx_sp] / np.max(sp_float_np[idx_sp])
+            est_doa = doasys.get_doa(sp_float_np, doa_num, doa_grid, args.max_target_num, doa)
+            accum_sdoa_float[si] += np.sum(np.power(np.abs(est_doa - doa), 2))
+
+            # FFT float
+            noisy_np = noisy.cpu().numpy()
+            r_c_float = noisy_np[:, 0, :] + 1j * noisy_np[:, 1, :]
+            sp_fft_float = np.power(np.abs(np.matmul(dic_mat_comp, np.conj(r_c_float).T)), 2).T
+            for idx_sp in range(sp_fft_float.shape[0]):
+                sp_fft_float[idx_sp] = sp_fft_float[idx_sp] / np.max(sp_fft_float[idx_sp])
+            est_doa = doasys.get_doa(sp_fft_float, doa_num, doa_grid, args.max_target_num, doa)
+            accum_fft_float[si] += np.sum(np.power(np.abs(est_doa - doa), 2))
+
+            # OMP float
+            est_doa_omp, _ = omp_doa(r_c_float, dic_mat_comp, doa_grid, target_num, args.max_target_num)
+            accum_omp_float[si] += np.sum(np.power(np.abs(est_doa_omp - doa), 2))
+
+            # ---------- 1-bit 信号环境 ----------
+            q_1bit = torch.sign(noisy)
+            q_np = q_1bit.cpu().numpy()
+            r_c_1bit = q_np[:, 0, :] + 1j * q_np[:, 1, :]
+
+            # FFT 1-bit
+            sp_fft_1bit = np.power(np.abs(np.matmul(dic_mat_comp, np.conj(r_c_1bit).T)), 2).T
+            for idx_sp in range(sp_fft_1bit.shape[0]):
+                sp_fft_1bit[idx_sp] = sp_fft_1bit[idx_sp] / np.max(sp_fft_1bit[idx_sp])
+            est_doa = doasys.get_doa(sp_fft_1bit, doa_num, doa_grid, args.max_target_num, doa)
+            accum_fft_1bit[si] += np.sum(np.power(np.abs(est_doa - doa), 2))
+
+            # OMP 1-bit
+            est_doa_omp, _ = omp_doa(r_c_1bit, dic_mat_comp, doa_grid, target_num, args.max_target_num)
+            accum_omp_1bit[si] += np.sum(np.power(np.abs(est_doa_omp - doa), 2))
+
+            # Dither-CovNet 不同 L（对比图固定用最大 L）
+            for li, L in enumerate(cov_L_list):
+                feat = doasys.dither_cov_feature(signal_t, L, args.dither_T, snr_dB=SNR_dB)
+                with torch.no_grad():
+                    output_net = net_1bit(feat).view(args.cov_test_len, 2, -1)
+                mm_real = torch.mm(output_net[:, 0, :], dic_mat_torch[:, 0, :].T) + torch.mm(output_net[:, 1, :], dic_mat_torch[:, 1, :].T)
+                mm_imag = torch.mm(output_net[:, 0, :], dic_mat_torch[:, 1, :].T) - torch.mm(output_net[:, 1, :], dic_mat_torch[:, 0, :].T)
+                sp = torch.pow(mm_real, 2) + torch.pow(mm_imag, 2)
+                sp_np = sp.cpu().detach().numpy()
+                for idx_sp in range(sp_np.shape[0]):
+                    sp_np[idx_sp] = sp_np[idx_sp] / np.max(sp_np[idx_sp])
+                est_doa = doasys.get_doa(sp_np, doa_num, doa_grid, args.max_target_num, doa)
+                accum_cov[li, si] += np.sum(np.power(np.abs(est_doa - doa), 2))
+
+    RMSE_cov = np.sqrt(accum_cov / total_units)
+    RMSE_sdoa_float = np.sqrt(accum_sdoa_float / total_units)
+    RMSE_fft_float = np.sqrt(accum_fft_float / total_units)
+    RMSE_omp_float = np.sqrt(accum_omp_float / total_units)
+    RMSE_fft_1bit = np.sqrt(accum_fft_1bit / total_units)
+    RMSE_omp_1bit = np.sqrt(accum_omp_1bit / total_units)
+
+    # 图 1：六条曲线，固定最大 L（默认 L=256）的 Dither-CovNet 作为 SDOA-1bit
+    max_L = cov_L_list[-1]
+    plt.figure(figsize=(8, 5.5))
+    # 浮点环境
+    plt.semilogy(SNR_range, RMSE_sdoa_float, '-o', linewidth=2, markersize=6,
+                 label='SDOA-Attn (float)')
+    plt.semilogy(SNR_range, RMSE_fft_float, '--v', linewidth=2, markersize=6,
+                 label='FFT (float)')
+    plt.semilogy(SNR_range, RMSE_omp_float, '--+', linewidth=2, markersize=6,
+                 label='OMP (float)')
+    # 1-bit 环境
+    plt.semilogy(SNR_range, RMSE_cov[-1], '-s', linewidth=2, markersize=6,
+                 label='SDOA-Attn-1bit (Dither-CovNet L=%d)' % max_L)
+    plt.semilogy(SNR_range, RMSE_fft_1bit, '--^', linewidth=2, markersize=6,
+                 label='FFT (1-bit)')
+    plt.semilogy(SNR_range, RMSE_omp_1bit, '--x', linewidth=2, markersize=6,
+                 label='OMP (1-bit)')
+    plt.xlabel('SNR (dB)')
+    plt.ylabel('RMSE (deg)')
+    plt.legend(loc='best', fontsize=8)
+    plt.grid(True, which='both', ls='--')
+    plt.title('Dither-CovNet vs Traditional Methods (float / 1-bit)')
+    plt.savefig('RMSE_Dither_CovNet_comparison.png', dpi=300, bbox_inches='tight')
+    print('Saved RMSE_Dither_CovNet_comparison.png')
+
+    # 图 2：同一网络不同 L 的 RMSE 对比（保持原样）
+    plt.figure(figsize=(8, 5.5))
+    for i, L in enumerate(cov_L_list):
+        plt.semilogy(SNR_range, RMSE_cov[i], '-o', linewidth=2, label='L=%d' % L)
+    plt.xlabel('SNR (dB)')
+    plt.ylabel('RMSE (deg)')
+    plt.legend()
+    plt.grid(True, which='both', ls='--')
+    plt.title('Dither-CovNet: Effect of Snapshot Number L')
+    plt.savefig('RMSE_Dither_CovNet_Lsweep.png', dpi=300, bbox_inches='tight')
+    print('Saved RMSE_Dither_CovNet_Lsweep.png')
+
+    # 打印结果表
+    print('\n=== RMSE (deg) ===')
+    print('SDOA float : ' + ' '.join('%.3f' % v for v in RMSE_sdoa_float))
+    print('FFT float   : ' + ' '.join('%.3f' % v for v in RMSE_fft_float))
+    print('OMP float   : ' + ' '.join('%.3f' % v for v in RMSE_omp_float))
+    for i, L in enumerate(cov_L_list):
+        print('Dither-CovNet L=%4d: ' % L + ' '.join('%.3f' % v for v in RMSE_cov[i]))
+    print('FFT 1-bit   : ' + ' '.join('%.3f' % v for v in RMSE_fft_1bit))
+    print('OMP 1-bit   : ' + ' '.join('%.3f' % v for v in RMSE_omp_1bit))
+
+
 if __name__ == '__main__':
 
     is_music = False  # 服务器无MATLAB许可证，已关闭MUSIC对比
@@ -114,12 +305,28 @@ if __name__ == '__main__':
     parser.add_argument('--is_1bit', type=int, default=0, help='enable 1-bit quantization in gen_signal (kept as 0 for test data generation)')
     parser.add_argument('--is_1bit_test', type=int, default=0, help='test with 1-bit quantized signals')
 
+    # ---------- Dither-CovNet 测试 ----------
+    parser.add_argument('--input_mode', type=str, default='signal', choices=['signal', 'cov'],
+                        help='signal: old test flow; cov: run Dither-CovNet experiment')
+    parser.add_argument('--model_cov', type=str, default='net_1bit_cov_L16_T3p0.pkl',
+                        help='Dither-CovNet model path')
+    parser.add_argument('--dither_T', type=float, default=3.0,
+                        help='uniform dither scale T (must match training)')
+    parser.add_argument('--cov_L_list', type=str, default='16,64,256',
+                        help='snapshot list for the Dither-CovNet L-sweep figure, e.g. "16,64,256"')
+    parser.add_argument('--cov_test_len', type=int, default=2000, help='samples per round in cov test')
+    parser.add_argument('--cov_test_rounds', type=int, default=5, help='rounds in cov test (increase for smoother curves)')
+
     args = parser.parse_args()
 
     if torch.cuda.is_available():
         args.use_cuda = True
     else:
         args.use_cuda = False
+
+    if args.input_mode == 'cov':
+        run_cov_experiment(args)
+        sys.exit(0)
 
     # np.random.seed(args.numpy_seed)
     # torch.manual_seed(args.torch_seed)

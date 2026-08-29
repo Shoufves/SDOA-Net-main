@@ -1,0 +1,55 @@
+\documentclass[tikz,border=10pt]{standalone}
+\usepackage{ctex}
+\usepackage{amsmath,amssymb}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=1.2cm, minimum width=2.8cm, inner sep=4pt},
+  pre/.style={box, fill=blue!8},
+  mid/.style={box, fill=orange!12},
+  outbox/.style={box, fill=green!10},
+  blackbox/.style={draw, dashed, thick, rounded corners=5pt, inner sep=8pt},
+  arrow/.style={-{Stealth[length=3mm]}, thick},
+  note/.style={font=\scriptsize\bfseries, text=black!70}
+]
+
+% ========== 输入 / 预处理 ==========
+\node[pre] (q) {L 个快拍\\ 1-bit 复信号\\ \(q_1,\ q_2\)};
+\node[pre, right=1.0cm of q] (tau) {已知均匀抖动\\ \(\tau_1,\ \tau_2\)\\ \(T=3\)};
+\node[pre, right=1.0cm of tau] (cov) {1-bit 协方差\\ \(\hat{R}\)\\ 上三角 272 维};
+\draw[arrow] (q) -- (tau);
+\draw[arrow] (tau) -- (cov);
+\node[note, above=0.05cm of q] {输入 / 预处理（线性空间）};
+
+% ========== 网络（黑盒） ==========
+\node[mid, right=1.4cm of cov] (in) {in\_layer\\ \(272 \rightarrow 64\)};
+\node[mid, below=0.45cm of in] (reshape) {reshape\\ \((2, 32)\)};
+\node[mid, below=0.45cm of reshape] (conv) {6\(\times\) Conv1d\\ + BN + ReLU};
+\node[mid, below=0.45cm of conv] (attn) {CrossAttention\\ 4 heads};
+\node[mid, below=0.45cm of attn] (out) {out\_layer\\ \(64 \rightarrow 32\)};
+
+\draw[arrow] (cov) -- (in);
+\draw[arrow] (in) -- (reshape);
+\draw[arrow] (reshape) -- (conv);
+\draw[arrow] (conv) -- (attn);
+\draw[arrow] (attn) -- (out);
+
+\node[blackbox, fit=(in)(out)] (bb) {};
+\node[note, above=0.05cm of bb] {网络（核心黑盒：可学习非线性映射）};
+
+% ========== 输出 / DOA ==========
+\node[outbox, right=1.4cm of out] (h) {\(h \in \mathbb{R}^{32}\)};
+\node[outbox, right=1.4cm of h] (sp) {空间谱\\ \(sp(\theta) = |a^H(\theta) h|^2\)};
+\node[outbox, right=1.4cm of sp] (doa) {峰值搜索\\ DOA 估计};
+\draw[arrow] (out) -- (h);
+\draw[arrow] (h) -- (sp);
+\draw[arrow] (sp) -- (doa);
+\node[note, above=0.05cm of h] {输出（字典/谱/峰值搜索，非学习部分）};
+
+% ========== 底部说明 ==========
+\node[note, below=0.5cm of doa] {关键：1-bit 非线性输入 \(\rightarrow\) 抖动协方差 \(\rightarrow\) 线性空间 \(\rightarrow\) 网络 \(\rightarrow\) 空间谱 \(\rightarrow\) DOA};
+
+\end{tikzpicture}
+\end{document}
